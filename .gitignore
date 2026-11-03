@@ -1,0 +1,6 @@
+node_modules/
+.venv/
+*.db
+__pycache__/
+.expo/
+dist/

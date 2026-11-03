@@ -1,0 +1,18 @@
+# Render Blueprint: безкоштовний web-сервіс. База даних зовнішня (Neon): рядок підключення вводить власник у панелі Render.
+services:
+  - type: web
+    name: vdrama-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false          # вставити з Neon (не зберігати в репозиторії)
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_KEY
+        generateValue: true
+      - key: PLAY_VERIFY_MODE
+        value: mock
