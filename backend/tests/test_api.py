@@ -203,8 +203,8 @@ def test_wheel_free_daily_and_odds(c):
     assert w["free_available"] and w["spins"] == 1 and len(w["segments"]) == 8
     assert abs(sum(s["odds_pct"] for s in w["segments"]) - 100) < 0.2 and "не можна вивести" in w["rules"]
     r = c.post("/wheel/spin", headers=h).json()
-    assert r["coins"] == w["segments"][r["segment"]]["coins"] and r["coins"] in (5, 10, 15, 20, 30, 50, 100)
-    assert r["coins"] == c.get("/wallet", headers=h).json()["coins"]
+    assert r["won"] == w["segments"][r["segment"]]["coins"] and r["won"] in (5, 10, 15, 20, 30, 50, 100)
+    assert r["coins"] == r["won"] == c.get("/wallet", headers=h).json()["coins"]   # у нового гравця баланс = виграш
     assert r["wheel"]["free_available"] is False
     j = c.post("/wheel/spin", headers=h)
     assert j.status_code == 429 and j.json()["detail"]["error"] == "no_spins"
@@ -237,3 +237,53 @@ def test_quests_flow_and_grant_spin(c):
     assert c.post("/quests/favorite/claim", headers=h).json()["reward_coins"] == 10
     assert c.post("/quests/favorite/claim", headers=h).status_code == 409
     assert c.post("/quests/nope/claim", headers=h).status_code == 404
+
+
+def test_spin_reports_won_separately_from_balance(c):
+    h = login(c)
+    buy(c, h, "coins_499", "mock-rich")           # баланс 700
+    r = c.post("/wheel/spin", headers=h).json()
+    assert r["coins"] == 700 + r["won"] and r["won"] in (5, 10, 15, 20, 30, 50, 100)
+
+
+def test_like_rewards_once_with_daily_cap(c):
+    h = login(c)
+    sid, ids = seed(c, free=40, eps=25)
+    r = c.put(f"/episodes/{ids[0]}/like", headers=h).json()
+    assert r["liked"] and r["reward"] == 1 and r["coins"] == 1 and r["likes"] == 1
+    c.delete(f"/episodes/{ids[0]}/like", headers=h)
+    r = c.put(f"/episodes/{ids[0]}/like", headers=h).json()
+    assert r["reward"] == 0 and r["coins"] == 1                 # повторний лайк тієї ж серії не годує
+    for i in ids[1:22]:
+        c.put(f"/episodes/{i}/like", headers=h)
+    w = c.get("/wallet", headers=h).json()
+    assert w["coins"] == 20 and w["likes_today"] == 20 and w["likes_cap"] == 20   # ліміт 20 на добу
+    eps = c.get(f"/series/{sid}/episodes", headers=h).json()
+    assert eps[0]["liked"] and eps[0]["likes"] == 1 and eps[24]["liked"] is False
+
+
+def test_profile_nickname_and_referral(c):
+    a, b = login(c, "device-0101"), login(c, "device-0102")
+    pa = c.get("/me/profile", headers=a).json()
+    assert pa["is_guest"] and len(pa["ref_code"]) == 6 and pa["display_name"].startswith("Глядач #")
+    assert c.put("/me/profile", json={"nickname": "  Олег   К  "}, headers=a).json()["display_name"] == "Олег К"
+    assert c.post("/referral/redeem", json={"code": pa["ref_code"]}, headers=a).status_code == 400     # свій код
+    assert c.post("/referral/redeem", json={"code": "ZZZZZZ"}, headers=b).status_code == 404
+    r = c.post("/referral/redeem", json={"code": pa["ref_code"].lower()}, headers=b).json()
+    assert r["reward_coins"] == 20 and r["coins"] == 20
+    assert c.post("/referral/redeem", json={"code": pa["ref_code"]}, headers=b).status_code == 409
+    assert c.get("/wallet", headers=a).json()["coins"] == 0       # запрошувач чекає, поки друг подивиться 3 серії
+    sid, ids = seed(c, free=10, eps=4)
+    for i in ids[:3]:
+        c.post("/progress", json={"episode_id": i, "position_sec": 9}, headers=b)
+    assert c.get("/wallet", headers=a).json()["coins"] == 30
+    assert c.get("/me/profile", headers=a).json()["invited"] == 1 == c.get("/me/profile", headers=a).json()["referral_rewards"] // 30
+
+
+def test_app_version_check(c):
+    assert c.get("/app/version", params={"code": 1}).json() == {"update_available": False}
+    assert c.post("/admin/app-release", json={"version_code": 5, "version_name": "0.5.0", "apk_url": "https://x/a.apk"}).status_code == 403
+    c.post("/admin/app-release", json={"version_code": 5, "version_name": "0.5.0", "apk_url": "https://x/a.apk", "notes": "n"}, headers=ADMIN)
+    j = c.get("/app/version", params={"code": 4}).json()
+    assert j["update_available"] and j["latest_name"] == "0.5.0" and j["apk_url"] == "https://x/a.apk" and j["mandatory"] is False
+    assert c.get("/app/version", params={"code": 5}).json()["update_available"] is False
