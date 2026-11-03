@@ -1,5 +1,7 @@
 from datetime import timedelta
+from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -11,6 +13,11 @@ from .models import Episode, Series, Transaction, Unlock, User, WatchProgress, n
 from .security import admin_only, current_user, make_token
 
 app = FastAPI(title="Vertical Drama API", version="0.1.0")
+
+# Демо-відео роздаємо самим сервером (лише для демо; для справжніх серій потрібне окреме сховище/CDN)
+_static = Path(__file__).resolve().parent.parent / "static"
+if _static.is_dir():
+    app.mount("/static", StaticFiles(directory=_static), name="static")
 
 
 @app.on_event("startup")
@@ -249,6 +256,23 @@ def admin_add_episode(body: EpisodeIn, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(409, "episode_number_exists")
     return {"id": ep.id, "number": ep.number}
+
+
+class EpisodePatch(BaseModel):
+    title: str | None = None
+    video_url: str | None = None
+    duration_sec: int | None = Field(default=None, ge=0)
+
+
+@app.patch("/admin/episodes/{episode_id}", dependencies=[Depends(admin_only)])
+def admin_patch_episode(episode_id: int, body: EpisodePatch, db: Session = Depends(get_db)):
+    ep = db.get(Episode, episode_id)
+    if not ep:
+        raise HTTPException(404, "episode_not_found")
+    for k, v in body.model_dump(exclude_none=True).items():
+        setattr(ep, k, v)
+    db.commit()
+    return {"id": ep.id, "number": ep.number, "video_url": ep.video_url}
 
 
 @app.get("/health")
