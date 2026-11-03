@@ -1,7 +1,9 @@
 import secrets
+from contextvars import ContextVar
 from datetime import timedelta
 from pathlib import Path
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -10,7 +12,7 @@ from sqlalchemy.orm import Session, object_session
 
 from . import billing
 from .db import Base, engine, get_db
-from .models import (AppRelease, Episode, EpisodeLike, Favorite, Profile, QuestClaim, ReferralLink, Series, SpinGrant,
+from .models import (AppRelease, Episode, EpisodeLike, EpisodeSubtitle, Favorite, GenreTranslation, Profile, QuestClaim, ReferralLink, Series, SeriesTranslation, SpinGrant,
                      SpinLog, Transaction, Unlock, User, WatchProgress, now)
 from .security import admin_only, current_user, make_token
 
@@ -20,6 +22,20 @@ app = FastAPI(title="Vertical Drama API", version="0.1.0")
 _static = Path(__file__).resolve().parent.parent / "static"
 if _static.is_dir():
     app.mount("/static", StaticFiles(directory=_static), name="static")
+
+
+LANGS = {"uk", "en", "de", "fr", "pl", "es", "pt", "it", "sr", "hr", "cnr", "el", "tr"}
+_lang: ContextVar[str] = ContextVar("lang", default="uk")
+
+
+@app.middleware("http")
+async def _lang_mw(request: Request, call_next):
+    code = (request.headers.get("x-lang") or "uk").lower().split("-")[0]
+    tok = _lang.set(code if code in LANGS else "uk")
+    try:
+        return await call_next(request)
+    finally:
+        _lang.reset(tok)
 
 
 @app.on_event("startup")
@@ -45,8 +61,25 @@ def get_episode(db: Session, episode_id: int) -> Episode:
     return ep
 
 
+def tr_genre(db: Session | None, genre: str) -> str:
+    lang = _lang.get()
+    if not genre or lang == "uk" or db is None:
+        return genre
+    g = db.scalar(select(GenreTranslation.name).where(GenreTranslation.genre == genre, GenreTranslation.lang == lang))
+    return g or genre
+
+
 def series_out(s: Series):
-    return {"id": s.id, "title": s.title, "description": s.description, "genre": s.genre,
+    title, desc, genre = s.title, s.description, s.genre
+    lang = _lang.get()
+    if lang != "uk":
+        db = object_session(s)
+        if db is not None:
+            tr = db.scalar(select(SeriesTranslation).where(SeriesTranslation.series_id == s.id, SeriesTranslation.lang == lang))
+            if tr:
+                title, desc = tr.title or title, tr.description or desc
+            genre = tr_genre(db, genre)
+    return {"id": s.id, "title": title, "description": desc, "genre": genre,
             "poster_url": s.poster_url, "free_episodes": s.free_episodes,
             "coin_price": s.coin_price, "episodes_count": len(s.episodes)}
 
@@ -402,16 +435,16 @@ def home(db: Session = Depends(get_db), user: User = Depends(current_user)):
         select(Episode.series_id, func.count(func.distinct(WatchProgress.user_id)))
         .join(WatchProgress, WatchProgress.episode_id == Episode.id).group_by(Episode.series_id)).all())
     popular = sorted(allp, key=lambda x: (-views.get(x.id, 0), -x.id))
-    rows = [{"title": "Новинки", "items": [series_out(x) for x in allp[:10]]},
-            {"title": "Популярне", "items": [series_out(x) for x in popular[:10]]}]
+    rows = [{"key": "new", "title": "Новинки", "items": [series_out(x) for x in allp[:10]]},
+            {"key": "popular", "title": "Популярне", "items": [series_out(x) for x in popular[:10]]}]
     genres = []
     for x in allp:
         if x.genre and x.genre not in genres:
             genres.append(x.genre)
     for g in genres:
-        rows.append({"title": g, "items": [series_out(x) for x in allp if x.genre == g][:10]})
+        rows.append({"key": "genre", "title": tr_genre(db, g), "items": [series_out(x) for x in allp if x.genre == g][:10]})
     return {"featured": [series_out(x) for x in popular[:4]], "continue_watching": continue_items(db, user),
-            "genres": genres, "rows": rows}
+            "genres": [tr_genre(db, g) for g in genres], "rows": rows}
 
 
 def bundle_discount(n: int) -> float:
@@ -517,7 +550,7 @@ def wheel_spin(db: Session = Depends(get_db), user: User = Depends(current_user)
 QUESTS = {
     "watch_3": ("Подивитись 3 серії", 3, 10, 0, "daily"),
     "watch_10": ("Подивитись 10 серій", 10, 25, 1, "daily"),
-    "spin": ("Крутнути колесо фортуни", 1, 5, 0, "daily"),
+    "spin": ("Запустити «Щасливий кадр»", 1, 5, 0, "daily"),
     "favorite": ("Додати серіал до «Мого списку»", 1, 10, 0, "once"),
 }
 
@@ -733,6 +766,75 @@ class ReleaseIn(BaseModel):
 @app.post("/admin/app-release", dependencies=[Depends(admin_only)])
 def admin_app_release(body: ReleaseIn, db: Session = Depends(get_db)):
     db.add(AppRelease(**body.model_dump()))
+    db.commit()
+    return {"ok": True}
+
+
+# ---------- мови: субтитри та переклади каталогу ----------
+@app.get("/episodes/{episode_id}/subtitles")
+def list_subtitles(episode_id: int, db: Session = Depends(get_db)):
+    get_episode(db, episode_id)
+    rows = db.execute(select(EpisodeSubtitle.lang, EpisodeSubtitle.machine).where(EpisodeSubtitle.episode_id == episode_id)).all()
+    return [{"lang": l, "machine": m, "url": f"/episodes/{episode_id}/subtitles/{l}.vtt"} for l, m in rows]
+
+
+@app.get("/episodes/{episode_id}/subtitles/{lang}.vtt", response_class=PlainTextResponse)
+def get_subtitle(episode_id: int, lang: str, db: Session = Depends(get_db)):
+    get_episode(db, episode_id)
+    row = db.scalar(select(EpisodeSubtitle).where(EpisodeSubtitle.episode_id == episode_id, EpisodeSubtitle.lang == lang))
+    if not row:
+        raise HTTPException(404, "subtitle_not_found")
+    return PlainTextResponse(row.vtt, media_type="text/vtt; charset=utf-8")
+
+
+class SubtitleIn(BaseModel):
+    vtt: str = Field(min_length=6, max_length=200_000)
+    machine: bool = True
+
+
+@app.put("/admin/episodes/{episode_id}/subtitles/{lang}", dependencies=[Depends(admin_only)])
+def admin_put_subtitle(episode_id: int, lang: str, body: SubtitleIn, db: Session = Depends(get_db)):
+    if lang not in LANGS or not body.vtt.lstrip().startswith("WEBVTT"):
+        raise HTTPException(422, "bad_lang_or_vtt")
+    get_episode(db, episode_id)
+    row = db.scalar(select(EpisodeSubtitle).where(EpisodeSubtitle.episode_id == episode_id, EpisodeSubtitle.lang == lang))
+    if row:
+        row.vtt, row.machine = body.vtt, body.machine
+    else:
+        db.add(EpisodeSubtitle(episode_id=episode_id, lang=lang, vtt=body.vtt, machine=body.machine))
+    db.commit()
+    return {"ok": True}
+
+
+class SeriesTrIn(BaseModel):
+    title: str = ""
+    description: str = ""
+
+
+@app.put("/admin/series/{series_id}/translations/{lang}", dependencies=[Depends(admin_only)])
+def admin_put_series_tr(series_id: int, lang: str, body: SeriesTrIn, db: Session = Depends(get_db)):
+    if lang not in LANGS or not db.get(Series, series_id):
+        raise HTTPException(404, "not_found")
+    row = db.scalar(select(SeriesTranslation).where(SeriesTranslation.series_id == series_id, SeriesTranslation.lang == lang))
+    if row:
+        row.title, row.description = body.title, body.description
+    else:
+        db.add(SeriesTranslation(series_id=series_id, lang=lang, title=body.title, description=body.description))
+    db.commit()
+    return {"ok": True}
+
+
+@app.put("/admin/genres/{lang}", dependencies=[Depends(admin_only)])
+def admin_put_genres(lang: str, body: dict[str, str], db: Session = Depends(get_db)):
+    """Тіло: {"Драма": "Drama", ...} — переклад назв жанрів."""
+    if lang not in LANGS:
+        raise HTTPException(422, "bad_lang")
+    for g, name in body.items():
+        row = db.scalar(select(GenreTranslation).where(GenreTranslation.genre == g, GenreTranslation.lang == lang))
+        if row:
+            row.name = name
+        else:
+            db.add(GenreTranslation(genre=g, lang=lang, name=name))
     db.commit()
     return {"ok": True}
 
