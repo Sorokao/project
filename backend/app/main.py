@@ -1,3 +1,4 @@
+import secrets
 from datetime import timedelta
 from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException
@@ -5,11 +6,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from . import billing
 from .db import Base, engine, get_db
-from .models import Episode, Favorite, Series, Transaction, Unlock, User, WatchProgress, now
+from .models import (Episode, Favorite, QuestClaim, Series, SpinGrant, SpinLog, Transaction, Unlock, User,
+                     WatchProgress, now)
 from .security import admin_only, current_user, make_token
 
 app = FastAPI(title="Vertical Drama API", version="0.1.0")
@@ -59,9 +61,33 @@ def bonus_state(u: User):
     return False, u.bonus_streak + 1, (u.last_bonus_at + timedelta(hours=24)).isoformat()
 
 
+def today() -> str:
+    return now().strftime("%Y-%m-%d")
+
+
+def first_purchase_available(db: Session, u: User) -> bool:
+    return db.scalar(select(Transaction.id).where(Transaction.user_id == u.id, Transaction.kind == "purchase",
+                                                  Transaction.coins_delta > 0)) is None
+
+
+def free_spin_available(db: Session, u: User) -> bool:
+    return db.scalar(select(SpinLog.id).where(SpinLog.user_id == u.id, SpinLog.day == today(),
+                                              SpinLog.source == "free")) is None
+
+
+def grants_left(db: Session, u: User) -> int:
+    return db.scalar(select(func.count(SpinGrant.id)).where(SpinGrant.user_id == u.id, SpinGrant.used.is_(False))) or 0
+
+
 def wallet_out(u: User):
     available, next_streak, next_at = bonus_state(u)
-    return {"coins": u.coins_balance, "vip": is_vip(u),
+    db = object_session(u)
+    extra = {}
+    if db is not None:
+        free = free_spin_available(db, u)
+        extra = {"first_purchase_available": first_purchase_available(db, u), "wheel_free": free,
+                 "spins": (1 if free else 0) + grants_left(db, u)}
+    return {**extra, "coins": u.coins_balance, "vip": is_vip(u),
             "vip_until": u.vip_until.isoformat() if u.vip_until else None,
             "bonus_streak": u.bonus_streak if not available or next_streak > 1 else 0,
             "bonus_available": available, "next_bonus": min(5 * next_streak, 30),
@@ -182,7 +208,11 @@ def billing_verify(body: VerifyIn, db: Session = Depends(get_db), user: User = D
     if not res.ok:
         raise HTTPException(400, {"error": "invalid_purchase", "reason": res.reason})
     coins = billing.COIN_PACKS.get(body.product_id, 0)
+    bonus = 0
     if coins:
+        if first_purchase_available(db, user):
+            bonus = billing.FIRST_PURCHASE_BONUS.get(body.product_id, billing.FIRST_PURCHASE_DEFAULT)
+        coins += bonus
         user.coins_balance += coins
     else:
         start = user.vip_until if is_vip(user) else now()
@@ -195,7 +225,7 @@ def billing_verify(body: VerifyIn, db: Session = Depends(get_db), user: User = D
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, "duplicate_token")
-    return {"duplicate": False, **wallet_out(user)}
+    return {"duplicate": False, "first_bonus": bonus, **wallet_out(user)}
 
 
 class ProgressIn(BaseModel):
@@ -367,9 +397,33 @@ def home(db: Session = Depends(get_db), user: User = Depends(current_user)):
             "genres": genres, "rows": rows}
 
 
+def bundle_discount(n: int) -> float:
+    """Чим більше серій одним пакетом, тим більша знижка."""
+    return 0.0 if n < 2 else 0.10 if n < 5 else 0.15 if n < 10 else 0.25 if n < 20 else 0.35
+
+
+def bundle_price(n: int, coin_price: int) -> int:
+    return round(n * coin_price * (1 - bundle_discount(n)))
+
+
 class BundleIn(BaseModel):
     from_episode_id: int
-    count: int = Field(ge=1, le=10)
+    count: int = Field(ge=1, le=100)
+
+
+@app.get("/series/{series_id}/bundles")
+def bundle_options(series_id: int, from_episode_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Варіанти пакетів: 1 серія, 5 серій і «усі решта» (якщо їх більше 5)."""
+    s = db.get(Series, series_id)
+    start = db.get(Episode, from_episode_id)
+    if not s or not s.published or not start or start.series_id != series_id:
+        raise HTTPException(404, "not_found")
+    locked = [e for e in s.episodes if e.number >= start.number and not can_watch(db, user, e)]
+    counts = [n for n in (1, 5) if n <= len(locked)]
+    if len(locked) > 5:
+        counts.append(len(locked))
+    return [{"count": n, "price": bundle_price(n, s.coin_price), "full_price": n * s.coin_price,
+             "discount_pct": round(bundle_discount(n) * 100), "all": n == len(locked) and n > 5} for n in counts]
 
 
 @app.post("/series/{series_id}/unlock-bundle")
@@ -381,7 +435,7 @@ def unlock_bundle(series_id: int, body: BundleIn, db: Session = Depends(get_db),
     todo = [e for e in s.episodes if e.number >= start.number and not can_watch(db, user, e)][: body.count]
     if not todo:
         return {"unlocked": 0, "charged": 0, **wallet_out(user)}
-    price = round(len(todo) * s.coin_price * (0.9 if len(todo) > 1 else 1))
+    price = bundle_price(len(todo), s.coin_price)
     if user.coins_balance < price:
         raise HTTPException(402, {"error": "not_enough_coins", "need": price, "have": user.coins_balance})
     user.coins_balance -= price
@@ -391,6 +445,119 @@ def unlock_bundle(series_id: int, body: BundleIn, db: Session = Depends(get_db),
     db.merge(user)
     db.commit()
     return {"unlocked": len(todo), "charged": price, **wallet_out(user)}
+
+
+# ---------- колесо фортуни (лише віртуальні коїни, спіни не продаються) ----------
+# (коїни, вага з 1000). Середній виграш = 13,3 коїна ≈ 0,67 серії. Шанси показуються користувачеві.
+WHEEL = [(5, 150), (10, 280), (15, 180), (20, 100), (5, 150), (30, 60), (50, 30), (100, 10)]
+_rng = secrets.SystemRandom()
+
+
+def wheel_out(db: Session, user: User):
+    free = free_spin_available(db, user)
+    total = sum(w for _, w in WHEEL)
+    return {"segments": [{"index": i, "coins": c, "odds_pct": round(w * 100 / total, 1)} for i, (c, w) in enumerate(WHEEL)],
+            "free_available": free, "grants": grants_left(db, user), "spins": (1 if free else 0) + grants_left(db, user),
+            "next_free_at": None if free else (now().replace(hour=0, minute=0, second=0, microsecond=0)
+                                               + timedelta(days=1)).isoformat(),
+            "rules": "Колесо безкоштовне: 1 спін на добу та спіни за завдання. Купити спін неможливо. "
+                     "Виграш — лише віртуальні коїни застосунку, їх не можна вивести чи обміняти на гроші."}
+
+
+@app.get("/wheel")
+def wheel_info(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    return wheel_out(db, user)
+
+
+@app.post("/wheel/spin")
+def wheel_spin(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    source = None
+    if free_spin_available(db, user):
+        source = "free"
+    else:
+        g = db.scalar(select(SpinGrant).where(SpinGrant.user_id == user.id, SpinGrant.used.is_(False))
+                      .order_by(SpinGrant.id).limit(1))
+        if g:
+            g.used, source = True, "grant"
+    if source is None:
+        raise HTTPException(429, {"error": "no_spins", "next_free_at": wheel_out(db, user)["next_free_at"]})
+    idx = _rng.choices(range(len(WHEEL)), weights=[w for _, w in WHEEL])[0]
+    coins = WHEEL[idx][0]
+    user.coins_balance += coins
+    db.add(SpinLog(user_id=user.id, day=today(), source=source, segment=idx, coins=coins))
+    db.add(Transaction(user_id=user.id, kind="wheel", coins_delta=coins))
+    db.merge(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "retry")
+    return {"segment": idx, "coins": coins, **wallet_out(user), "wheel": wheel_out(db, user)}
+
+
+# ---------- щоденні завдання ----------
+# id: (назва, ціль, коїни, спіни, періодичність)
+QUESTS = {
+    "watch_3": ("Подивитись 3 серії", 3, 10, 0, "daily"),
+    "watch_10": ("Подивитись 10 серій", 10, 25, 1, "daily"),
+    "spin": ("Крутнути колесо фортуни", 1, 5, 0, "daily"),
+    "favorite": ("Додати серіал до «Мого списку»", 1, 10, 0, "once"),
+}
+
+
+def quest_progress(db: Session, user: User, qid: str) -> int:
+    day_start = now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if qid.startswith("watch"):
+        return db.scalar(select(func.count(WatchProgress.id)).where(
+            WatchProgress.user_id == user.id, WatchProgress.updated_at >= day_start, WatchProgress.position_sec >= 3)) or 0
+    if qid == "spin":
+        return db.scalar(select(func.count(SpinLog.id)).where(SpinLog.user_id == user.id, SpinLog.day == today())) or 0
+    if qid == "favorite":
+        return db.scalar(select(func.count(Favorite.id)).where(Favorite.user_id == user.id)) or 0
+    return 0
+
+
+def quest_day(qid: str) -> str:
+    return "once" if QUESTS[qid][4] == "once" else today()
+
+
+def quests_out(db: Session, user: User):
+    out = []
+    for qid, (title, target, coins, spins, kind) in QUESTS.items():
+        claimed = db.scalar(select(QuestClaim.id).where(QuestClaim.user_id == user.id, QuestClaim.quest_id == qid,
+                                                        QuestClaim.day == quest_day(qid))) is not None
+        prog = min(quest_progress(db, user, qid), target)
+        out.append({"id": qid, "title": title, "target": target, "progress": prog, "reward_coins": coins,
+                    "reward_spins": spins, "kind": kind, "claimed": claimed, "claimable": prog >= target and not claimed})
+    return out
+
+
+@app.get("/quests")
+def quests(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    return quests_out(db, user)
+
+
+@app.post("/quests/{quest_id}/claim")
+def quest_claim(quest_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    q = next((x for x in quests_out(db, user) if x["id"] == quest_id), None)
+    if not q:
+        raise HTTPException(404, "quest_not_found")
+    if q["claimed"]:
+        raise HTTPException(409, "already_claimed")
+    if not q["claimable"]:
+        raise HTTPException(400, "not_completed")
+    db.add(QuestClaim(user_id=user.id, quest_id=quest_id, day=quest_day(quest_id)))
+    user.coins_balance += q["reward_coins"]
+    for _ in range(q["reward_spins"]):
+        db.add(SpinGrant(user_id=user.id, source=f"quest:{quest_id}"))
+    db.add(Transaction(user_id=user.id, kind="quest", coins_delta=q["reward_coins"], product_id=quest_id))
+    db.merge(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "already_claimed")
+    return {**wallet_out(user), "reward_coins": q["reward_coins"], "reward_spins": q["reward_spins"], "quests": quests_out(db, user)}
 
 
 @app.get("/health")
