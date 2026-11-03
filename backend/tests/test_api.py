@@ -104,3 +104,16 @@ def test_duplicate_episode_number(c):
     sid, _ = seed(c, eps=1)
     r = c.post("/admin/episodes", json={"series_id": sid, "number": 1, "video_url": "x"}, headers=ADMIN)
     assert r.status_code == 409
+
+
+def test_admin_patch_episode(c):
+    _, ids = seed(c, eps=1)
+    assert c.patch(f"/admin/episodes/{ids[0]}", json={"video_url": "http://x/new.mp4"}).status_code == 403
+    r = c.patch(f"/admin/episodes/{ids[0]}", json={"video_url": "http://x/new.mp4"}, headers=ADMIN)
+    assert r.json()["video_url"] == "http://x/new.mp4"
+    assert c.patch("/admin/episodes/9999", json={}, headers=ADMIN).status_code == 404
+
+
+def test_static_video_served_with_range(c):
+    r = c.get("/static/videos/demo_space.mp4", headers={"Range": "bytes=0-99"})
+    assert r.status_code == 206 and len(r.content) == 100
