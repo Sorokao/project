@@ -287,3 +287,30 @@ def test_app_version_check(c):
     j = c.get("/app/version", params={"code": 4}).json()
     assert j["update_available"] and j["latest_name"] == "0.5.0" and j["apk_url"] == "https://x/a.apk" and j["mandatory"] is False
     assert c.get("/app/version", params={"code": 5}).json()["update_available"] is False
+
+
+def test_subtitles_and_translations(c):
+    sid, ids = seed(c)
+    h = login(c)
+    vtt = "WEBVTT\n\n00:00.000 --> 00:02.000\nHello\n"
+    assert c.put(f"/admin/episodes/{ids[0]}/subtitles/en", json={"vtt": vtt}).status_code == 403
+    assert c.put(f"/admin/episodes/{ids[0]}/subtitles/xx", json={"vtt": vtt}, headers=ADMIN).status_code == 422
+    assert c.put(f"/admin/episodes/{ids[0]}/subtitles/en", json={"vtt": "bad text"}, headers=ADMIN).status_code == 422
+    assert c.put(f"/admin/episodes/{ids[0]}/subtitles/en", json={"vtt": vtt}, headers=ADMIN).json() == {"ok": True}
+    c.put(f"/admin/episodes/{ids[0]}/subtitles/en", json={"vtt": vtt + "\n00:02.000 --> 00:03.000\nBye\n", "machine": False}, headers=ADMIN)
+    lst = c.get(f"/episodes/{ids[0]}/subtitles").json()
+    assert lst == [{"lang": "en", "machine": False, "url": f"/episodes/{ids[0]}/subtitles/en.vtt"}]
+    r = c.get(lst[0]["url"])
+    assert r.status_code == 200 and "Bye" in r.text and r.headers["content-type"].startswith("text/vtt")
+    assert c.get(f"/episodes/{ids[0]}/subtitles/pl.vtt").status_code == 404
+    # переклади каталогу: без X-Lang — оригінал; з X-Lang — переклад; без запису — оригінал
+    c.put(f"/admin/series/{sid}/translations/pl", json={"title": "Tytuł", "description": "Opis"}, headers=ADMIN)
+    c.put("/admin/genres/pl", json={"Драма": "Dramat"}, headers=ADMIN)
+    assert c.get(f"/series/{sid}").json()["title"] == "T"
+    assert c.get(f"/series/{sid}", headers={"X-Lang": "pl"}).json()["title"] == "Tytuł"
+    assert c.get(f"/series/{sid}", headers={"X-Lang": "pl-PL"}).json()["description"] == "Opis"
+    assert c.get(f"/series/{sid}", headers={"X-Lang": "de"}).json()["title"] == "T"
+    assert c.get(f"/series/{sid}", headers={"X-Lang": "zz"}).json()["title"] == "T"
+    rows = c.get("/home", headers={**h, "X-Lang": "pl"}).json()["rows"]
+    assert [r["key"] for r in rows[:2]] == ["new", "popular"] and rows[0]["items"][0]["title"] == "Tytuł"
+    assert c.put("/admin/genres/zz", json={"a": "b"}, headers=ADMIN).status_code == 422
