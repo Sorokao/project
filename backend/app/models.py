@@ -114,3 +114,46 @@ class QuestClaim(Base):
     quest_id: Mapped[str] = mapped_column(String(30))
     day: Mapped[str] = mapped_column(String(10))  # YYYY-MM-DD або "once"
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class EpisodeLike(Base):
+    """Лайк серії. rewarded=True, якщо за цей лайк уже видано 1 коїн (повторні лайки коїнів не дають)."""
+    __tablename__ = "episode_likes"
+    __table_args__ = (UniqueConstraint("user_id", "episode_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    episode_id: Mapped[int] = mapped_column(ForeignKey("episodes.id"), index=True)
+    liked: Mapped[bool] = mapped_column(Boolean, default=True)
+    rewarded: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class Profile(Base):
+    """Публічні дані користувача: ім'я та реферальний код (колонок у users не додаємо, щоб не міняти схему)."""
+    __tablename__ = "profiles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True)
+    nickname: Mapped[str] = mapped_column(String(40), default="")
+    ref_code: Mapped[str] = mapped_column(String(12), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class ReferralLink(Base):
+    __tablename__ = "referral_links"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    referee_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True)
+    referrer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    rewarded: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class AppRelease(Base):
+    """Остання версія застосунку для сповіщення про оновлення (APK поза Google Play)."""
+    __tablename__ = "app_releases"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version_code: Mapped[int] = mapped_column(Integer, index=True)
+    version_name: Mapped[str] = mapped_column(String(30))
+    apk_url: Mapped[str] = mapped_column(String(500))
+    notes: Mapped[str] = mapped_column(Text, default="")
+    mandatory: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
