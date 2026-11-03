@@ -24,7 +24,7 @@ if _static.is_dir():
     app.mount("/static", StaticFiles(directory=_static), name="static")
 
 
-LANGS = {"uk", "en", "de", "fr", "pl", "es", "pt", "it", "sr", "hr", "cnr", "el", "tr"}
+LANGS = {"uk", "en", "de", "fr", "pl", "es", "pt", "it", "sr", "hr", "cnr", "el", "tr", "nl", "ro", "cs", "sk", "hu", "sl", "bg", "sq", "mk", "bs", "sv", "da", "no", "lt", "lv", "et"}
 _lang: ContextVar[str] = ContextVar("lang", default="uk")
 
 
