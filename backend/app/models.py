@@ -157,3 +157,34 @@ class AppRelease(Base):
     notes: Mapped[str] = mapped_column(Text, default="")
     mandatory: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class SeriesTranslation(Base):
+    """Переклад назви й опису серіалу (мова UI глядача). Немає запису -> показуємо оригінал."""
+    __tablename__ = "series_translations"
+    __table_args__ = (UniqueConstraint("series_id", "lang"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    series_id: Mapped[int] = mapped_column(ForeignKey("series.id"), index=True)
+    lang: Mapped[str] = mapped_column(String(8))
+    title: Mapped[str] = mapped_column(String(200), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+
+
+class GenreTranslation(Base):
+    __tablename__ = "genre_translations"
+    __table_args__ = (UniqueConstraint("genre", "lang"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    genre: Mapped[str] = mapped_column(String(60))
+    lang: Mapped[str] = mapped_column(String(8))
+    name: Mapped[str] = mapped_column(String(60))
+
+
+class EpisodeSubtitle(Base):
+    """Субтитри серії однією мовою у форматі WebVTT. Генеруються пайплайном (розпізнавання -> переклад -> вичитка)."""
+    __tablename__ = "episode_subtitles"
+    __table_args__ = (UniqueConstraint("episode_id", "lang"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    episode_id: Mapped[int] = mapped_column(ForeignKey("episodes.id"), index=True)
+    lang: Mapped[str] = mapped_column(String(8))
+    vtt: Mapped[str] = mapped_column(Text, default="")
+    machine: Mapped[bool] = mapped_column(Boolean, default=True)  # True = машинний переклад без вичитки
