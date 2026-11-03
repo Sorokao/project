@@ -10,8 +10,8 @@ from sqlalchemy.orm import Session, object_session
 
 from . import billing
 from .db import Base, engine, get_db
-from .models import (Episode, Favorite, QuestClaim, Series, SpinGrant, SpinLog, Transaction, Unlock, User,
-                     WatchProgress, now)
+from .models import (AppRelease, Episode, EpisodeLike, Favorite, Profile, QuestClaim, ReferralLink, Series, SpinGrant,
+                     SpinLog, Transaction, Unlock, User, WatchProgress, now)
 from .security import admin_only, current_user, make_token
 
 app = FastAPI(title="Vertical Drama API", version="0.1.0")
@@ -79,13 +79,23 @@ def grants_left(db: Session, u: User) -> int:
     return db.scalar(select(func.count(SpinGrant.id)).where(SpinGrant.user_id == u.id, SpinGrant.used.is_(False))) or 0
 
 
+LIKE_REWARD, LIKE_DAILY_CAP = 1, 20   # 1 коїн за новий лайк, до 20 коїнів на добу (= 1 серія)
+
+
+def likes_today(db: Session, u: User) -> int:
+    day_start = now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return db.scalar(select(func.count(Transaction.id)).where(
+        Transaction.user_id == u.id, Transaction.kind == "like", Transaction.created_at >= day_start)) or 0
+
+
 def wallet_out(u: User):
     available, next_streak, next_at = bonus_state(u)
     db = object_session(u)
     extra = {}
     if db is not None:
         free = free_spin_available(db, u)
-        extra = {"first_purchase_available": first_purchase_available(db, u), "wheel_free": free,
+        extra = {"likes_today": likes_today(db, u), "likes_cap": LIKE_DAILY_CAP,
+                 "first_purchase_available": first_purchase_available(db, u), "wheel_free": free,
                  "spins": (1 if free else 0) + grants_left(db, u)}
     return {**extra, "coins": u.coins_balance, "vip": is_vip(u),
             "vip_until": u.vip_until.isoformat() if u.vip_until else None,
@@ -140,8 +150,14 @@ def list_episodes(series_id: int, db: Session = Depends(get_db), user: User = De
     s = db.get(Series, series_id)
     if not s or not s.published:
         raise HTTPException(404, "series_not_found")
+    ids = [e.id for e in s.episodes]
+    mine = set(db.scalars(select(EpisodeLike.episode_id).where(
+        EpisodeLike.user_id == user.id, EpisodeLike.liked.is_(True), EpisodeLike.episode_id.in_(ids))).all())
+    counts = dict(db.execute(select(EpisodeLike.episode_id, func.count(EpisodeLike.id)).where(
+        EpisodeLike.liked.is_(True), EpisodeLike.episode_id.in_(ids)).group_by(EpisodeLike.episode_id)).all())
     return [{"id": e.id, "number": e.number, "title": e.title, "duration_sec": e.duration_sec,
-             "locked": not can_watch(db, user, e)} for e in s.episodes]
+             "locked": not can_watch(db, user, e), "liked": e.id in mine, "likes": counts.get(e.id, 0)}
+            for e in s.episodes]
 
 
 # ---------- playback / unlock ----------
@@ -242,6 +258,7 @@ def progress(body: ProgressIn, db: Session = Depends(get_db), user: User = Depen
     else:
         db.add(WatchProgress(user_id=user.id, episode_id=ep.id, position_sec=body.position_sec))
     db.commit()
+    settle_referral(db, user)
     return {"ok": True}
 
 
@@ -492,7 +509,7 @@ def wheel_spin(db: Session = Depends(get_db), user: User = Depends(current_user)
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, "retry")
-    return {"segment": idx, "coins": coins, **wallet_out(user), "wheel": wheel_out(db, user)}
+    return {**wallet_out(user), "segment": idx, "won": coins, "wheel": wheel_out(db, user)}
 
 
 # ---------- щоденні завдання ----------
@@ -558,6 +575,166 @@ def quest_claim(quest_id: str, db: Session = Depends(get_db), user: User = Depen
         db.rollback()
         raise HTTPException(409, "already_claimed")
     return {**wallet_out(user), "reward_coins": q["reward_coins"], "reward_spins": q["reward_spins"], "quests": quests_out(db, user)}
+
+
+# ---------- лайки серій ----------
+@app.put("/episodes/{episode_id}/like")
+def like_episode(episode_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Лайк. Перший лайк кожної серії дає 1 коїн (до 20 на добу); повторні лайки після зняття коїнів не дають."""
+    ep = get_episode(db, episode_id)
+    row = db.scalar(select(EpisodeLike).where(EpisodeLike.user_id == user.id, EpisodeLike.episode_id == ep.id))
+    reward = 0
+    if row is None:
+        row = EpisodeLike(user_id=user.id, episode_id=ep.id, liked=True)
+        db.add(row)
+    else:
+        row.liked = True
+    if not row.rewarded and likes_today(db, user) < LIKE_DAILY_CAP:
+        row.rewarded, reward = True, LIKE_REWARD
+        user.coins_balance += reward
+        db.add(Transaction(user_id=user.id, kind="like", coins_delta=reward, product_id=str(ep.id)))
+        db.merge(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"liked": True, "reward": 0, **wallet_out(user)}
+    total = db.scalar(select(func.count(EpisodeLike.id)).where(EpisodeLike.episode_id == ep.id, EpisodeLike.liked.is_(True)))
+    return {"liked": True, "reward": reward, "likes": total, **wallet_out(user)}
+
+
+@app.delete("/episodes/{episode_id}/like")
+def unlike_episode(episode_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    ep = get_episode(db, episode_id)
+    row = db.scalar(select(EpisodeLike).where(EpisodeLike.user_id == user.id, EpisodeLike.episode_id == ep.id))
+    if row:
+        row.liked = False
+        db.commit()
+    total = db.scalar(select(func.count(EpisodeLike.id)).where(EpisodeLike.episode_id == ep.id, EpisodeLike.liked.is_(True)))
+    return {"liked": False, "reward": 0, "likes": total, **wallet_out(user)}
+
+
+# ---------- профіль і реферали ----------
+REF_REFEREE_BONUS, REF_REFERRER_BONUS, REF_MAX = 20, 30, 20
+_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def get_profile(db: Session, user: User) -> Profile:
+    p = db.scalar(select(Profile).where(Profile.user_id == user.id))
+    if p:
+        return p
+    for _ in range(10):
+        code = "".join(secrets.choice(_ALPHABET) for _ in range(6))
+        if not db.scalar(select(Profile.id).where(Profile.ref_code == code)):
+            break
+    p = Profile(user_id=user.id, nickname="", ref_code=code)
+    db.add(p)
+    db.commit()
+    return p
+
+
+def profile_out(db: Session, user: User):
+    p = get_profile(db, user)
+    link = db.scalar(select(ReferralLink).where(ReferralLink.referee_id == user.id))
+    invited = db.scalar(select(func.count(ReferralLink.id)).where(ReferralLink.referrer_id == user.id)) or 0
+    earned = db.scalar(select(func.count(ReferralLink.id)).where(
+        ReferralLink.referrer_id == user.id, ReferralLink.rewarded.is_(True))) or 0
+    watched = db.scalar(select(func.count(WatchProgress.id)).where(
+        WatchProgress.user_id == user.id, WatchProgress.position_sec >= 3)) or 0
+    return {"user_id": user.id, "nickname": p.nickname, "display_name": p.nickname or f"Глядач #{user.id}",
+            "ref_code": p.ref_code, "is_guest": True, "member_since": user.created_at.isoformat(),
+            "episodes_watched": watched, "referred_by_set": link is not None, "invited": invited,
+            "referral_rewards": earned * REF_REFERRER_BONUS,
+            "referee_bonus": REF_REFEREE_BONUS, "referrer_bonus": REF_REFERRER_BONUS}
+
+
+@app.get("/me/profile")
+def me_profile(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    return profile_out(db, user)
+
+
+class ProfileIn(BaseModel):
+    nickname: str = Field(max_length=40)
+
+
+@app.put("/me/profile")
+def me_profile_update(body: ProfileIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    p = get_profile(db, user)
+    p.nickname = " ".join(body.nickname.split())[:40]
+    db.commit()
+    return profile_out(db, user)
+
+
+class RedeemIn(BaseModel):
+    code: str = Field(min_length=4, max_length=12)
+
+
+@app.post("/referral/redeem")
+def referral_redeem(body: RedeemIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Введення коду друга: ви отримуєте бонус одразу, друг — коли ви подивитесь 3 серії."""
+    me = get_profile(db, user)
+    code = body.code.strip().upper()
+    ref = db.scalar(select(Profile).where(Profile.ref_code == code))
+    if not ref:
+        raise HTTPException(404, "code_not_found")
+    if ref.user_id == user.id or code == me.ref_code:
+        raise HTTPException(400, "own_code")
+    if db.scalar(select(ReferralLink.id).where(ReferralLink.referee_id == user.id)):
+        raise HTTPException(409, "already_redeemed")
+    if (db.scalar(select(func.count(ReferralLink.id)).where(ReferralLink.referrer_id == ref.user_id)) or 0) >= REF_MAX:
+        raise HTTPException(409, "code_limit_reached")
+    db.add(ReferralLink(referee_id=user.id, referrer_id=ref.user_id))
+    user.coins_balance += REF_REFEREE_BONUS
+    db.add(Transaction(user_id=user.id, kind="referral", coins_delta=REF_REFEREE_BONUS, product_id="referee"))
+    db.merge(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "already_redeemed")
+    return {"reward_coins": REF_REFEREE_BONUS, **wallet_out(user)}
+
+
+def settle_referral(db: Session, user: User):
+    """Викликається з /progress: коли запрошений подивився 3 серії, запрошувач отримує бонус."""
+    link = db.scalar(select(ReferralLink).where(ReferralLink.referee_id == user.id, ReferralLink.rewarded.is_(False)))
+    if not link:
+        return
+    watched = db.scalar(select(func.count(WatchProgress.id)).where(
+        WatchProgress.user_id == user.id, WatchProgress.position_sec >= 3)) or 0
+    if watched < 3:
+        return
+    link.rewarded = True
+    referrer = db.get(User, link.referrer_id)
+    if referrer:
+        referrer.coins_balance += REF_REFERRER_BONUS
+        db.add(Transaction(user_id=referrer.id, kind="referral", coins_delta=REF_REFERRER_BONUS, product_id="referrer"))
+    db.commit()
+
+
+# ---------- оновлення застосунку ----------
+@app.get("/app/version")
+def app_version(code: int = 0, db: Session = Depends(get_db)):
+    r = db.scalar(select(AppRelease).order_by(AppRelease.version_code.desc()).limit(1))
+    if not r:
+        return {"update_available": False}
+    return {"update_available": r.version_code > code, "latest_code": r.version_code, "latest_name": r.version_name,
+            "apk_url": r.apk_url, "notes": r.notes, "mandatory": r.mandatory and r.version_code > code}
+
+
+class ReleaseIn(BaseModel):
+    version_code: int = Field(ge=1)
+    version_name: str
+    apk_url: str
+    notes: str = ""
+    mandatory: bool = False
+
+
+@app.post("/admin/app-release", dependencies=[Depends(admin_only)])
+def admin_app_release(body: ReleaseIn, db: Session = Depends(get_db)):
+    db.add(AppRelease(**body.model_dump()))
+    db.commit()
+    return {"ok": True}
 
 
 @app.get("/health")
