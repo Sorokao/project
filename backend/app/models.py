@@ -82,3 +82,35 @@ class Favorite(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     series_id: Mapped[int] = mapped_column(ForeignKey("series.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class SpinLog(Base):
+    """Кожне прокручування колеса: джерело (free/grant), виграш у коїнах, день (UTC)."""
+    __tablename__ = "spin_log"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    day: Mapped[str] = mapped_column(String(10), index=True)
+    source: Mapped[str] = mapped_column(String(10))
+    segment: Mapped[int] = mapped_column(Integer)
+    coins: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class SpinGrant(Base):
+    """Додаткові спіни, видані за завдання (за гроші спіни не продаються)."""
+    __tablename__ = "spin_grants"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    source: Mapped[str] = mapped_column(String(30))
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class QuestClaim(Base):
+    __tablename__ = "quest_claims"
+    __table_args__ = (UniqueConstraint("user_id", "quest_id", "day"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    quest_id: Mapped[str] = mapped_column(String(30))
+    day: Mapped[str] = mapped_column(String(10))  # YYYY-MM-DD або "once"
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
