@@ -546,29 +546,90 @@ def wheel_spin(db: Session = Depends(get_db), user: User = Depends(current_user)
 
 
 # ---------- щоденні завдання ----------
-# id: (назва, ціль, коїни, спіни, періодичність)
+# id: (назва, ціль, коїни, спіни, періодичність: daily | weekly | once)
+# Економіка: див. docs/economy. Розрахунок: максимум за добу ~50 коїнів + 1 спін (≈63), за тиждень ~125 + 2 спіни,
+# разом разові ~115 + 2 спіни. Нагорода спіном — лише за завдання середньої та вищої складності.
 QUESTS = {
-    "watch_3": ("Watch 3 episodes", 3, 10, 0, "daily"),
-    "watch_10": ("Watch 10 episodes", 10, 25, 1, "daily"),
-    "spin": ("Play Lucky Frame", 1, 5, 0, "daily"),
+    # щоденні
+    "watch_3": ("Watch 3 episodes", 3, 8, 0, "daily"),
+    "watch_10": ("Watch 10 episodes", 10, 20, 1, "daily"),
+    "spin": ("Play Lucky Frame", 1, 4, 0, "daily"),
+    "like_5": ("Like 5 episodes", 5, 6, 0, "daily"),
+    "bonus_1": ("Claim the daily reward", 1, 4, 0, "daily"),
+    "unlock_2": ("Unlock 2 episodes with coins", 2, 8, 0, "daily"),
+    # тижневі
+    "week_watch_30": ("Watch 30 episodes this week", 30, 40, 1, "weekly"),
+    "week_streak_5": ("Claim the daily reward on 5 days", 5, 30, 0, "weekly"),
+    "week_series_3": ("Watch 3 different series", 3, 20, 0, "weekly"),
+    "week_like_25": ("Like 25 episodes this week", 25, 20, 1, "weekly"),
+    "week_spin_5": ("Play Lucky Frame 5 times", 5, 15, 0, "weekly"),
+    # разові
     "favorite": ("Add a series to My List", 1, 10, 0, "once"),
+    "invite_1": ("Invite a friend", 1, 40, 1, "once"),
+    "first_unlock": ("Unlock your first episode with coins", 1, 15, 0, "once"),
+    "finish_series": ("Finish a whole series", 1, 50, 1, "once"),
 }
 
 
+def period_start(kind: str):
+    d = now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if kind == "weekly":
+        return d - timedelta(days=d.weekday())
+    if kind == "once":
+        return d - timedelta(days=36500)
+    return d
+
+
+def _count(db: Session, model, *conds) -> int:
+    return db.scalar(select(func.count(model.id)).where(*conds)) or 0
+
+
 def quest_progress(db: Session, user: User, qid: str) -> int:
-    day_start = now().replace(hour=0, minute=0, second=0, microsecond=0)
-    if qid.startswith("watch"):
-        return db.scalar(select(func.count(WatchProgress.id)).where(
-            WatchProgress.user_id == user.id, WatchProgress.updated_at >= day_start, WatchProgress.position_sec >= 3)) or 0
-    if qid == "spin":
-        return db.scalar(select(func.count(SpinLog.id)).where(SpinLog.user_id == user.id, SpinLog.day == today())) or 0
+    kind = QUESTS[qid][4]
+    since = period_start(kind)
+    if qid.startswith("watch") or qid == "week_watch_30":
+        return _count(db, WatchProgress, WatchProgress.user_id == user.id, WatchProgress.updated_at >= since,
+                      WatchProgress.position_sec >= 3)
+    if qid == "week_series_3":
+        return db.scalar(select(func.count(func.distinct(Episode.series_id))).select_from(WatchProgress)
+                         .join(Episode, Episode.id == WatchProgress.episode_id)
+                         .where(WatchProgress.user_id == user.id, WatchProgress.updated_at >= since,
+                                WatchProgress.position_sec >= 3)) or 0
+    if qid in ("spin", "week_spin_5"):
+        return _count(db, SpinLog, SpinLog.user_id == user.id, SpinLog.created_at >= since)
+    if qid in ("like_5", "week_like_25"):
+        return _count(db, EpisodeLike, EpisodeLike.user_id == user.id, EpisodeLike.created_at >= since)
+    if qid in ("bonus_1", "week_streak_5"):
+        return _count(db, Transaction, Transaction.user_id == user.id, Transaction.kind == "daily_bonus",
+                      Transaction.created_at >= since)
+    if qid in ("unlock_2", "first_unlock"):
+        return _count(db, Unlock, Unlock.user_id == user.id, Unlock.created_at >= since)
     if qid == "favorite":
-        return db.scalar(select(func.count(Favorite.id)).where(Favorite.user_id == user.id)) or 0
+        return _count(db, Favorite, Favorite.user_id == user.id)
+    if qid == "invite_1":
+        return _count(db, ReferralLink, ReferralLink.referrer_id == user.id)
+    if qid == "finish_series":
+        for sr in db.scalars(select(Series).where(Series.published.is_(True))).all():
+            total = len(sr.episodes)
+            if not total:
+                continue
+            seen = db.scalar(select(func.count(WatchProgress.id)).join(Episode, Episode.id == WatchProgress.episode_id)
+                             .where(WatchProgress.user_id == user.id, Episode.series_id == sr.id,
+                                    WatchProgress.position_sec >= 3)) or 0
+            if seen >= total:
+                return 1
+        return 0
     return 0
 
 
 def quest_day(qid: str) -> str:
-    return "once" if QUESTS[qid][4] == "once" else today()
+    kind = QUESTS[qid][4]
+    if kind == "once":
+        return "once"
+    if kind == "weekly":
+        y, w, _ = now().isocalendar()
+        return f"{y}-W{w:02d}"
+    return today()
 
 
 def quests_out(db: Session, user: User):
