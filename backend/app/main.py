@@ -25,12 +25,12 @@ if _static.is_dir():
 
 
 LANGS = {"uk", "en", "de", "fr", "pl", "es", "pt", "it", "sr", "hr", "cnr", "el", "tr", "nl", "ro", "cs", "sk", "hu", "sl", "bg", "sq", "mk", "bs", "sv", "da", "no", "lt", "lv", "et"}
-_lang: ContextVar[str] = ContextVar("lang", default="uk")
+_lang: ContextVar[str] = ContextVar("lang", default="en")
 
 
 @app.middleware("http")
 async def _lang_mw(request: Request, call_next):
-    code = (request.headers.get("x-lang") or "uk").lower().split("-")[0]
+    code = (request.headers.get("x-lang") or "en").lower().split("-")[0]
     tok = _lang.set(code if code in LANGS else "en")
     try:
         return await call_next(request)
