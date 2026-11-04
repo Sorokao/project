@@ -31,7 +31,7 @@ _lang: ContextVar[str] = ContextVar("lang", default="uk")
 @app.middleware("http")
 async def _lang_mw(request: Request, call_next):
     code = (request.headers.get("x-lang") or "uk").lower().split("-")[0]
-    tok = _lang.set(code if code in LANGS else "uk")
+    tok = _lang.set(code if code in LANGS else "en")
     try:
         return await call_next(request)
     finally:
@@ -435,8 +435,8 @@ def home(db: Session = Depends(get_db), user: User = Depends(current_user)):
         select(Episode.series_id, func.count(func.distinct(WatchProgress.user_id)))
         .join(WatchProgress, WatchProgress.episode_id == Episode.id).group_by(Episode.series_id)).all())
     popular = sorted(allp, key=lambda x: (-views.get(x.id, 0), -x.id))
-    rows = [{"key": "new", "title": "Новинки", "items": [series_out(x) for x in allp[:10]]},
-            {"key": "popular", "title": "Популярне", "items": [series_out(x) for x in popular[:10]]}]
+    rows = [{"key": "new", "title": "New", "items": [series_out(x) for x in allp[:10]]},
+            {"key": "popular", "title": "Popular", "items": [series_out(x) for x in popular[:10]]}]
     genres = []
     for x in allp:
         if x.genre and x.genre not in genres:
@@ -510,8 +510,8 @@ def wheel_out(db: Session, user: User):
             "free_available": free, "grants": grants_left(db, user), "spins": (1 if free else 0) + grants_left(db, user),
             "next_free_at": None if free else (now().replace(hour=0, minute=0, second=0, microsecond=0)
                                                + timedelta(days=1)).isoformat(),
-            "rules": "Колесо безкоштовне: 1 спін на добу та спіни за завдання. Купити спін неможливо. "
-                     "Виграш — лише віртуальні коїни застосунку, їх не можна вивести чи обміняти на гроші."}
+            "rules": "Lucky Frame is free: 1 try per day plus extra tries for quests. Tries cannot be purchased. "
+                     "Winnings are virtual in-app coins only; they cannot be withdrawn or exchanged for money."}
 
 
 @app.get("/wheel")
@@ -548,10 +548,10 @@ def wheel_spin(db: Session = Depends(get_db), user: User = Depends(current_user)
 # ---------- щоденні завдання ----------
 # id: (назва, ціль, коїни, спіни, періодичність)
 QUESTS = {
-    "watch_3": ("Подивитись 3 серії", 3, 10, 0, "daily"),
-    "watch_10": ("Подивитись 10 серій", 10, 25, 1, "daily"),
-    "spin": ("Запустити «Щасливий кадр»", 1, 5, 0, "daily"),
-    "favorite": ("Додати серіал до «Мого списку»", 1, 10, 0, "once"),
+    "watch_3": ("Watch 3 episodes", 3, 10, 0, "daily"),
+    "watch_10": ("Watch 10 episodes", 10, 25, 1, "daily"),
+    "spin": ("Play Lucky Frame", 1, 5, 0, "daily"),
+    "favorite": ("Add a series to My List", 1, 10, 0, "once"),
 }
 
 
@@ -674,7 +674,7 @@ def profile_out(db: Session, user: User):
         ReferralLink.referrer_id == user.id, ReferralLink.rewarded.is_(True))) or 0
     watched = db.scalar(select(func.count(WatchProgress.id)).where(
         WatchProgress.user_id == user.id, WatchProgress.position_sec >= 3)) or 0
-    return {"user_id": user.id, "nickname": p.nickname, "display_name": p.nickname or f"Глядач #{user.id}",
+    return {"user_id": user.id, "nickname": p.nickname, "display_name": p.nickname or f"Viewer #{user.id}",
             "ref_code": p.ref_code, "is_guest": True, "member_since": user.created_at.isoformat(),
             "episodes_watched": watched, "referred_by_set": link is not None, "invited": invited,
             "referral_rewards": earned * REF_REFERRER_BONUS,
